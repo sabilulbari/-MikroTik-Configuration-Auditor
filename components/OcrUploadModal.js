@@ -12,7 +12,9 @@ import {
   ArrowLeft, 
   Sparkles,
   RefreshCw,
-  Eye
+  FileText,
+  Sliders,
+  Check
 } from "lucide-react";
 import { createWorker } from "tesseract.js";
 import { parseOcrTextToQuestions, inferCategory } from "@/lib/ocr/ocrParser";
@@ -24,6 +26,7 @@ export default function OcrUploadModal({
   onImportQuestions,
   startingNumber = 1,
 }) {
+  const [activeMode, setActiveMode] = useState("image"); // 'image' | 'text'
   const [step, setStep] = useState("upload"); // 'upload' | 'processing' | 'review'
   const [selectedFile, setSelectedFile] = useState(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState(null);
@@ -31,6 +34,7 @@ export default function OcrUploadModal({
   const [progressPercent, setProgressPercent] = useState(0);
   const [ocrConfidence, setOcrConfidence] = useState(null);
   const [extractedQuestions, setExtractedQuestions] = useState([]);
+  const [manualText, setManualText] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const fileInputRef = useRef(null);
 
@@ -69,11 +73,32 @@ export default function OcrUploadModal({
     setImagePreviewUrl(URL.createObjectURL(file));
   };
 
+  // Preload sample image for instant testing
+  const handleLoadSampleImage = async () => {
+    try {
+      setErrorMessage("");
+      const response = await fetch("/sample-lab-tasks.png");
+      if (!response.ok) throw new Error("Could not load sample image");
+      const blob = await response.blob();
+      const file = new File([blob], "sample-lab-tasks.png", { type: "image/png" });
+      setSelectedFile(file);
+      setImagePreviewUrl(URL.createObjectURL(file));
+    } catch (err) {
+      console.warn("Could not load sample image file:", err);
+      // Fallback manual sample
+      setManualText(
+        "Question 1: Configure WAN IP Address\nAssign 203.0.113.10/24 on ether1 with comment 'WAN Uplink'.\n\nQuestion 2: Configure Masquerade NAT\nAdd srcnat masquerade rule on out-interface ether1.\n\nQuestion 3: Configure DHCP Server\nSetup DHCP server on ether2 using dhcp_pool."
+      );
+      setActiveMode("text");
+    }
+  };
+
+  // Run Tesseract.js OCR
   const handleProcessOcr = async () => {
     if (!selectedFile) return;
 
     setStep("processing");
-    setProgressPercent(0);
+    setProgressPercent(10);
     setProgressStatus("Initializing Tesseract OCR engine...");
     setErrorMessage("");
 
@@ -84,9 +109,9 @@ export default function OcrUploadModal({
           if (m.status === "recognizing text") {
             const pct = Math.round((m.progress || 0) * 100);
             setProgressPercent(pct);
-            setProgressStatus(`Recognizing text... ${pct}%`);
+            setProgressStatus(`Extracting text from image... ${pct}%`);
           } else {
-            setProgressStatus(m.status || "Analyzing image...");
+            setProgressStatus(m.status || "Analyzing image structure...");
           }
         },
       });
@@ -97,12 +122,12 @@ export default function OcrUploadModal({
 
       setOcrConfidence(Math.round(confidence));
 
-      // Parse the recognized text into question items
-      const questions = parseOcrTextToQuestions(text, startingNumber);
+      // Parse the recognized text into structured questions
+      const parsed = parseOcrTextToQuestions(text, startingNumber);
 
-      if (questions.length === 0) {
+      if (parsed.length === 0) {
         // Fallback: create at least one manual editable item with the raw text
-        questions.push({
+        parsed.push({
           id: `ocr-${Date.now()}-1`,
           number: startingNumber,
           title: "Extracted Configuration Question",
@@ -116,14 +141,21 @@ export default function OcrUploadModal({
         });
       }
 
-      setExtractedQuestions(questions);
+      setExtractedQuestions(parsed);
       setStep("review");
     } catch (err) {
-      console.error("OCR error:", err);
+      console.warn("Tesseract worker error (network or worker unavailable):", err);
+      // Seamless graceful fallback: allow the user to review or input text directly
       setErrorMessage(
-        "Failed to extract text from the image. Please verify the image is readable or enter tasks manually."
+        "The browser OCR engine was unable to initialize (worker/network restricted). You can use our instant text extraction tab below to parse your questions."
       );
       setStep("upload");
+      setActiveMode("text");
+      if (!manualText) {
+        setManualText(
+          "1. Configure WAN IP Address\nAssign 203.0.113.10/24 on ether1.\n\n2. Configure Masquerade NAT\nAdd srcnat masquerade rule on ether1."
+        );
+      }
     } finally {
       if (worker) {
         try {
@@ -133,6 +165,36 @@ export default function OcrUploadModal({
         }
       }
     }
+  };
+
+  // Process text entered manually / fallback
+  const handleProcessManualText = () => {
+    const trimmed = manualText.trim();
+    if (!trimmed) {
+      setErrorMessage("Please enter or paste question text to parse.");
+      return;
+    }
+
+    setOcrConfidence(95); // High confidence for direct text
+    const parsed = parseOcrTextToQuestions(trimmed, startingNumber);
+
+    if (parsed.length === 0) {
+      parsed.push({
+        id: `ocr-${Date.now()}-1`,
+        number: startingNumber,
+        title: "Configuration Question",
+        category: inferCategory(trimmed),
+        description: trimmed.slice(0, 250),
+        status: "pending",
+        configText: "",
+        routerOSVersion: "7.x",
+        verificationResult: null,
+        rules: null,
+      });
+    }
+
+    setExtractedQuestions(parsed);
+    setStep("review");
   };
 
   // Modify individual question in review screen
@@ -180,7 +242,7 @@ export default function OcrUploadModal({
       return;
     }
 
-    // Filter out any without title
+    // Filter out items without title
     const validQuestions = extractedQuestions
       .filter((q) => q.title && q.title.trim().length > 0)
       .map((q, idx) => ({
@@ -205,11 +267,12 @@ export default function OcrUploadModal({
     setProgressStatus("");
     setOcrConfidence(null);
     setErrorMessage("");
+    setManualText("");
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/50 backdrop-blur-xs">
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-3xl w-full max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
         {/* Modal Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 bg-slate-50/70">
           <div className="flex items-center gap-2.5">
@@ -218,12 +281,14 @@ export default function OcrUploadModal({
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-900">
-                {step === "review" ? "Review OCR Extracted Questions" : "Upload Question Image (OCR)"}
+                {step === "review"
+                  ? "Review & Correct Extracted Questions"
+                  : "Question Input & OCR Extraction"}
               </h2>
               <p className="text-xs text-slate-500">
                 {step === "review"
-                  ? "Verify, correct, and edit detected questions before importing to your dashboard"
-                  : "Upload a photo or screenshot of MikroTik questions (JPG or PNG)"}
+                  ? "Inspect confidence, edit titles/categories, and approve tasks before adding to your dashboard"
+                  : "Upload a lab assignment photo, screenshot (JPG/PNG), or paste text to extract questions"}
               </p>
             </div>
           </div>
@@ -238,6 +303,34 @@ export default function OcrUploadModal({
           </button>
         </div>
 
+        {/* Mode Switcher (only in upload step) */}
+        {step === "upload" && (
+          <div className="flex border-b border-slate-100 bg-slate-50/50 px-6 pt-2">
+            <button
+              onClick={() => setActiveMode("image")}
+              className={`pb-2 px-3 text-xs font-semibold border-b-2 flex items-center gap-1.5 transition-all ${
+                activeMode === "image"
+                  ? "border-blue-600 text-blue-600"
+                  : "border-transparent text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              <ImageIcon className="w-3.5 h-3.5" />
+              <span>Image Upload (OCR)</span>
+            </button>
+            <button
+              onClick={() => setActiveMode("text")}
+              className={`pb-2 px-3 text-xs font-semibold border-b-2 flex items-center gap-1.5 transition-all ${
+                activeMode === "text"
+                  ? "border-blue-600 text-blue-600"
+                  : "border-transparent text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Paste Text Directly</span>
+            </button>
+          </div>
+        )}
+
         {/* Modal Content */}
         <div className="p-6 overflow-y-auto flex-1 space-y-4">
           {errorMessage && (
@@ -248,7 +341,7 @@ export default function OcrUploadModal({
           )}
 
           {/* STEP 1: UPLOAD & PREVIEW */}
-          {step === "upload" && (
+          {step === "upload" && activeMode === "image" && (
             <div className="space-y-4">
               {/* Dropzone */}
               <div
@@ -275,20 +368,32 @@ export default function OcrUploadModal({
                 </p>
               </div>
 
+              {/* Sample image quick-load helper */}
+              <div className="flex items-center justify-between text-xs text-slate-500 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                <span>Want to test with a pre-configured lab sheet?</span>
+                <button
+                  type="button"
+                  onClick={handleLoadSampleImage}
+                  className="px-2.5 py-1 text-xs font-semibold text-blue-600 bg-white border border-blue-200 hover:bg-blue-50 rounded-md transition-colors shadow-2xs"
+                >
+                  Load Sample Lab Image
+                </button>
+              </div>
+
               {/* Image Preview if selected */}
               {imagePreviewUrl && (
                 <div className="border border-slate-200 rounded-xl p-3 bg-slate-50 space-y-2">
                   <div className="flex items-center justify-between text-xs text-slate-600 px-1">
                     <span className="font-medium truncate max-w-xs">{selectedFile?.name}</span>
                     <span className="text-slate-400 font-mono">
-                      {(selectedFile?.size / 1024).toFixed(1)} KB
+                      {selectedFile?.size ? (selectedFile.size / 1024).toFixed(1) : 0} KB
                     </span>
                   </div>
-                  <div className="max-h-64 overflow-hidden rounded-lg border border-slate-200 bg-black/5 flex items-center justify-center">
+                  <div className="max-h-60 overflow-hidden rounded-lg border border-slate-200 bg-black/5 flex items-center justify-center">
                     <img
                       src={imagePreviewUrl}
                       alt="Uploaded preview"
-                      className="max-h-64 object-contain"
+                      className="max-h-60 object-contain"
                     />
                   </div>
                 </div>
@@ -296,7 +401,26 @@ export default function OcrUploadModal({
             </div>
           )}
 
-          {/* STEP 1.5: PROCESSING */}
+          {/* STEP 1 (ALT): DIRECT TEXT EXTRACTION */}
+          {step === "upload" && activeMode === "text" && (
+            <div className="space-y-3">
+              <label className="block text-xs font-semibold text-slate-700">
+                Paste Lab Questions or Exam Text:
+              </label>
+              <textarea
+                rows={8}
+                value={manualText}
+                onChange={(e) => setManualText(e.target.value)}
+                placeholder={`1. Configure WAN IP Address\nAssign 203.0.113.10/24 on interface ether1.\n\n2. Configure Masquerade NAT\nAdd srcnat rule on out-interface ether1.\n\n3. Configure DHCP Server\nSetup DHCP server on ether2 using address-pool dhcp_pool.`}
+                className="w-full p-3 font-mono-code text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+              />
+              <p className="text-[11px] text-slate-400">
+                Our parser automatically detects numbered questions (1., Q1, Question 1) and infers categories.
+              </p>
+            </div>
+          )}
+
+          {/* STEP 1.5: PROCESSING STATE */}
           {step === "processing" && (
             <div className="py-12 text-center space-y-4">
               <div className="w-12 h-12 rounded-full bg-blue-50 text-blue-600 mx-auto flex items-center justify-center animate-spin">
@@ -307,7 +431,7 @@ export default function OcrUploadModal({
                   {progressStatus}
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
-                  Using local Tesseract.js engine. No files are uploaded to any server.
+                  Local client-side OCR analysis. Your image never leaves your browser.
                 </p>
               </div>
 
@@ -340,13 +464,14 @@ export default function OcrUploadModal({
                           : "bg-rose-100 text-rose-800 border-rose-200"
                       }`}
                     >
-                      OCR Confidence: {ocrConfidence}%
+                      Confidence: {ocrConfidence}%
                     </span>
                   )}
                 </div>
                 <button
+                  type="button"
                   onClick={handleAddMissingItem}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-white border border-blue-200 rounded-md hover:bg-blue-50 transition-colors"
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-white border border-blue-200 rounded-md hover:bg-blue-50 transition-colors shadow-2xs"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>Add Missing Question</span>
@@ -358,18 +483,18 @@ export default function OcrUploadModal({
                 {extractedQuestions.map((item, idx) => (
                   <div
                     key={item.id || idx}
-                    className="p-3.5 bg-white border border-slate-200 rounded-xl space-y-2.5 shadow-xs"
+                    className="p-3.5 bg-white border border-slate-200 rounded-xl space-y-2.5 shadow-2xs hover:border-slate-300 transition-colors"
                   >
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2 flex-1">
-                        <span className="text-xs font-bold text-slate-400 font-mono">
-                          #{idx + 1}
+                        <span className="text-xs font-bold text-slate-500 font-mono-code px-1.5 py-0.5 bg-slate-100 rounded">
+                          #{item.number || idx + 1}
                         </span>
                         <input
                           type="text"
                           value={item.title}
                           onChange={(e) => handleUpdateItem(idx, "title", e.target.value)}
-                          placeholder="Question Title"
+                          placeholder="Question Title (required)"
                           className="flex-1 px-2.5 py-1.5 text-xs font-semibold text-slate-800 bg-slate-50 border border-slate-200 rounded-md focus:bg-white focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                         />
                       </div>
@@ -385,8 +510,9 @@ export default function OcrUploadModal({
                         ))}
                       </select>
                       <button
+                        type="button"
                         onClick={() => handleDeleteItem(idx)}
-                        title="Remove false detection"
+                        title="Remove this extracted item"
                         className="p-1.5 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-colors"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -397,7 +523,7 @@ export default function OcrUploadModal({
                       rows={2}
                       value={item.description}
                       onChange={(e) => handleUpdateItem(idx, "description", e.target.value)}
-                      placeholder="Extracted details or constraints (editable)"
+                      placeholder="Extracted details, requirements, or constraints (optional)"
                       className="w-full px-2.5 py-1.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-md focus:bg-white focus:outline-hidden focus:ring-1 focus:ring-blue-500 font-sans"
                     />
                   </div>
@@ -453,15 +579,28 @@ export default function OcrUploadModal({
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                disabled={!selectedFile || step === "processing"}
-                onClick={handleProcessOcr}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm shadow-blue-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <Sparkles className="w-4 h-4" />
-                <span>Process with OCR</span>
-              </button>
+
+              {activeMode === "image" ? (
+                <button
+                  type="button"
+                  disabled={!selectedFile || step === "processing"}
+                  onClick={handleProcessOcr}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm shadow-blue-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>Process with OCR</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={!manualText.trim()}
+                  onClick={handleProcessManualText}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm shadow-blue-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>Extract Questions</span>
+                </button>
+              )}
             </>
           )}
         </div>
